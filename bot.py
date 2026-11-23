@@ -353,11 +353,27 @@ def main():
     state = load_state()
     sent = 0
     errors = 0
+    td_gate = PROVIDER == "twelvedata"
+    now = time.time()
+    fetch_log = state.setdefault("__fetch__", {})
+    total_combos = 0
     for sym in SYMBOLS:
         for tf in TIMEFRAMES:
             key = "%s_%s" % (sym, tf)
+            if td_gate:
+                sec = TIMEFRAMES[tf]["sec"]
+                if sec < 900:
+                    # sub-15m TFs can't be honored at a 15-min cron cadence;
+                    # skip them on the credit-capped free tier
+                    continue
+                if sec > 900 and now - fetch_log.get(key, 0) < sec - 120:
+                    # free tier budget: fetch 1h/4h only when due (~126
+                    # credits/symbol/day -> 6 symbols fits in 800/day)
+                    continue
+            total_combos += 1
             try:
                 bars = fetch_bars(sym, tf)
+                fetch_log[key] = now
             except Exception as e:
                 errors += 1
                 print("fetch failed %s: %s" % (key, e), file=sys.stderr)
@@ -393,7 +409,7 @@ def main():
             time.sleep(1)  # be gentle with the data provider
     save_state(state)
     print("done. messages sent:", sent, "fetch errors:", errors)
-    if errors == len(SYMBOLS) * len(TIMEFRAMES):
+    if total_combos and errors == total_combos:
         sys.exit(1)  # total failure -> mark the workflow run red
 
 
