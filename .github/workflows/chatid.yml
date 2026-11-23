@@ -6,13 +6,20 @@ on:
 jobs:
   chatid:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - name: fetch getUpdates
+      - name: fetch getUpdates with retries
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         run: |
-          curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates" -o updates.json
+          ok=0
+          for i in 1 2 3 4 5 6 7; do
+            code=$(curl -s -w "%{http_code}" "https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=-100" -o updates.json)
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            echo "attempt $i: HTTP $code $(head -c 120 updates.json)"
+            sleep 45
+          done
+          if [ "$ok" != "1" ]; then echo "GAVE_UP"; exit 0; fi
           python3 - <<'PY'
           import json
           d = json.load(open('updates.json'))
