@@ -1,43 +1,23 @@
-name: one-off chat id lookup
+name: send test message
 
 on:
   workflow_dispatch:
 
 jobs:
-  chatid:
+  test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: fetch getUpdates with retries
+      - name: send test message
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           ok=0
-          for i in 1 2 3 4 5 6 7; do
-            code=$(curl -s -w "%{http_code}" "https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=-100" -o updates.json)
-            if [ "$code" = "200" ]; then ok=1; break; fi
-            echo "attempt $i: HTTP $code $(head -c 120 updates.json)"
-            sleep 45
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -w "%{http_code}" --max-time 30 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=✅ تم تشغيل بوت HAKIM_FX وربطه بالقناة. كل إشارة جديدة هتوصل هنا تلقائيًا." -o resp.json)
+            if [ "$code" = "200" ]; then ok=1; echo "SENT_OK"; break; fi
+            echo "attempt $i: HTTP $code $(head -c 120 resp.json)"
+            sleep 40
           done
-          if [ "$ok" != "1" ]; then echo "GAVE_UP"; exit 0; fi
-          python3 - <<'PY'
-          import json
-          d = json.load(open('updates.json'))
-          if not d.get('ok'):
-              print('API_ERROR', d.get('description'))
-          seen = set()
-          for u in d.get('result', []):
-              for key in ('channel_post', 'my_chat_member', 'message'):
-                  m = u.get(key)
-                  if not m:
-                      continue
-                  c = m.get('chat', {})
-                  seen.add((c.get('id'), c.get('type'), c.get('title') or c.get('username')))
-              if 'my_chat_member' in u:
-                  c = u['my_chat_member'].get('chat', {})
-                  seen.add((c.get('id'), c.get('type'), c.get('title')))
-          for s in sorted(seen, key=str):
-              print('CHAT:', s)
-          if not seen:
-              print('NO_UPDATES')
-          PY
+          if [ "$ok" != "1" ]; then echo "SEND_FAILED"; exit 1; fi
