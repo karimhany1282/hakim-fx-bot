@@ -1,0 +1,36 @@
+name: one-off chat id lookup
+
+on:
+  workflow_dispatch:
+
+jobs:
+  chatid:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: fetch getUpdates
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        run: |
+          curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates" -o updates.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open('updates.json'))
+          if not d.get('ok'):
+              print('API_ERROR', d.get('description'))
+          seen = set()
+          for u in d.get('result', []):
+              for key in ('channel_post', 'my_chat_member', 'message'):
+                  m = u.get(key)
+                  if not m:
+                      continue
+                  c = m.get('chat', {})
+                  seen.add((c.get('id'), c.get('type'), c.get('title') or c.get('username')))
+              if 'my_chat_member' in u:
+                  c = u['my_chat_member'].get('chat', {})
+                  seen.add((c.get('id'), c.get('type'), c.get('title')))
+          for s in sorted(seen, key=str):
+              print('CHAT:', s)
+          if not seen:
+              print('NO_UPDATES')
+          PY
