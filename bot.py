@@ -478,6 +478,13 @@ def fetch_paxg_ticker():
     return float(data["price"])
 
 
+def fetch_paxg_1m(limit=8):
+    """Recent 1m PAXG bars INCLUDING the still-forming one: intrabar high/low
+    touch evidence for the last few minutes, newest last."""
+    k = _get_json("https://data-api.binance.vision/api/v3/klines?symbol=PAXGUSDT&interval=1m&limit=%d" % limit)
+    return [{"t": x[0] / 1000.0, "h": float(x[2]), "l": float(x[3])} for x in k]
+
+
 def _ema(a, n):
     k = 2.0 / (n + 1)
     o = []
@@ -626,6 +633,30 @@ def td_quote_xau():
         return None
 
 
+def _remote_scalp_unchanged(state, pkey, kind):
+    """Race guard for parallel invocations (regular 1-min run + touch hint):
+    re-read remote state; True = this event still needs sending."""
+    if not (GH_PAT and GH_REPO):
+        return True
+    try:
+        _, remote = _gh_state_get()
+        rst = (remote or {}).get(SCALP_KEY) or {}
+        ekey = pkey + ":" + kind
+        if ekey in rst.get("signaled", []):
+            return False
+        pos = (rst.get("positions") or {}).get(pkey)
+        if pos is None:
+            # entry not posted yet remotely, or already closed: only allow
+            # closing kinds when the position is still open there
+            return False
+        if kind.startswith("tp") and pos.get("tps_hit", 0) >= int(kind[2]):
+            return False
+        return True
+    except Exception as e:
+        print("remote recheck failed; deferring:", repr(e), file=sys.stderr)
+        return False
+
+
 def build_scalp_entry(dir_, entry, tps, sl, key):
     pip = SYMBOLS["XAUUSD"]["pip"]
     heads = ENTRY_BUY if dir_ == 1 else ENTRY_SELL
@@ -766,20 +797,23 @@ def run_scalp(state, now, sent, telegram_down):
             if ev["kind"] in ("sl", "be", "tp3"):
                 del st["positions"][pkey]
                 break
-    # --- live intra-bar touch check (1-min cron): stop first, then next TP ---
+    # --- live intra-bar touch check: walk recent 1m bars (incl. the forming
+    # one) oldest-first, then the live tick; stop before TP within a bar ---
     if st["positions"]:
         try:
-            live_paxg = fetch_paxg_ticker()
+            probe = fetch_paxg_1m(8)
+            tick = fetch_paxg_ticker()
+            probe.append({"t": time.time(), "h": tick, "l": tick})
         except Exception as e:
-            live_paxg = None
-            print("PAXG ticker failed (non-fatal):", repr(e), file=sys.stderr)
-        if live_paxg is not None:
-            for pkey in list(st["positions"].keys()):
-                pos = st["positions"][pkey]
-                d = pos["dir"]
+            probe = []
+            print("PAXG live probe failed (non-fatal):", repr(e), file=sys.stderr)
+        for pkey in list(st["positions"].keys()):
+            pos = st["positions"][pkey]
+            d = pos["dir"]
+            for yb in probe:
                 n_tp = pos.get("tps_hit", 0)
                 stop = pos["sl_p"] if n_tp == 0 else pos["entry_p"]
-                hit_stop = live_paxg <= stop if d > 0 else live_paxg >= stop
+                hit_stop = yb["l"] <= stop if d > 0 else yb["h"] >= stop
                 ev = None
                 if hit_stop:
                     kind = "sl" if n_tp == 0 else "be"
@@ -787,7 +821,7 @@ def run_scalp(state, now, sent, telegram_down):
                         ev = {"kind": kind, "bar_i": None}
                 elif n_tp < 3:
                     tp = pos["tps_p"][n_tp]
-                    hit_tp = live_paxg >= tp if d > 0 else live_paxg <= tp
+                    hit_tp = yb["h"] >= tp if d > 0 else yb["l"] <= tp
                     kind = "tp%d" % (n_tp + 1)
                     if hit_tp and pkey + ":" + kind not in st["signaled"]:
                         ev = {"kind": kind, "bar_i": None}
@@ -795,6 +829,12 @@ def run_scalp(state, now, sent, telegram_down):
                     continue
                 if sent >= MAX_MESSAGES_PER_RUN or telegram_down:
                     break
+                if not _remote_scalp_unchanged(state, pkey, ev["kind"]):
+                    # a concurrent run already handled it
+                    print("skip %s:%s - handled concurrently" % (pkey, ev["kind"]))
+                    if pkey + ":" + ev["kind"] in st["signaled"]:
+                        pass
+                    continue
                 reply_to = st["msg_ids"].get(pkey)
                 mid = send_telegram(build_scalp_outcome(pos, ev), reply_to=reply_to)
                 if not mid:
@@ -807,6 +847,7 @@ def run_scalp(state, now, sent, telegram_down):
                 time.sleep(0.3)
                 if ev["kind"] in ("sl", "be", "tp3"):
                     del st["positions"][pkey]
+                    break
     st["signaled"] = st["signaled"][-1500:]
     ids = st["msg_ids"]
     st["msg_ids"] = dict(list(ids.items())[-200:])
@@ -833,13 +874,19 @@ def _gh_api(method, path, body=None):
         return json.loads(r.read().decode())
 
 
+def _gh_state_get():
+    """Return (sha, state_dict) from the repo, or (None, None) on failure."""
+    import base64
+    d = _gh_api("GET", "/repos/%s/contents/state.json" % GH_REPO)
+    return d["sha"], json.loads(base64.b64decode(d["content"]).decode())
+
+
 def load_state():
     if GH_PAT and GH_REPO:
         # serverless mode: state.json lives in the GitHub repo
         try:
-            d = _gh_api("GET", "/repos/%s/contents/state.json" % GH_REPO)
-            import base64
-            return json.loads(base64.b64decode(d["content"]).decode())
+            _, st = _gh_state_get()
+            return st
         except Exception as e:
             print("state load from github failed: %s" % e, file=sys.stderr)
             return {}
