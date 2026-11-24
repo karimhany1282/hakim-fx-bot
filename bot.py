@@ -1143,6 +1143,248 @@ def run_ml(state, now, sent, telegram_down):
     return sent, telegram_down
 
 
+# ------------------------------------------------- 1m failed-breakout fade forward test
+# Dry-run forward test (24 Nov, parent task; gold paused - nothing posts to
+# Telegram). Two variants of the 1m failed-breakout fade on Yahoo GC=F 1m
+# (free; delayed ~10 min on the free tier - prices are real, log timestamps
+# lag by the feed delay). Mirrors fadeSignals in
+# https://hakim-gold.vercel.app/engine.js. Deliberate deviations:
+#  - the $4 D floor applies to BOTH variants per the task spec (the page
+#    engine uses MIND=0 for variant A) - flagged to parent;
+#  - the gap discard uses any per-bar gap > 600s inside the trade window
+#    (page uses the aggregate window-span rule); in-session trades never
+#    span the daily COMEX break, so only weekend-spanning trades differ.
+FBF_KEY = "XAU_fbfade"
+FBF_W = 120                 # time stop, bars (entry bar included)
+FBF_MIND = 4.0              # D floor in USD, per task spec
+FBF_SPREAD = 0.25           # USD per trade, for net R
+FBF_VARIANTS = (("A", 2.0, 120), ("B", 1.5, 144))
+FBF_RV = (2.0, 4.0, 6.0)    # R per third at TP1/2/3 (D / 0.5D)
+GCF_CHART = ("https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
+             "?interval=1m&range=5d")
+
+
+def fetch_gcf_1m():
+    """GC=F 1m bars: [{t,o,h,l,c,v}] ascending, null-close minutes dropped,
+    null volume -> 0. Includes the latest (possibly forming) bar; callers
+    treat a bar as closed only when t+60 <= now."""
+    data = _get_json(GCF_CHART, timeout=25)
+    r = data["chart"]["result"][0]
+    ts = r["timestamp"]
+    q = r["indicators"]["quote"][0]
+    out = []
+    for i, t in enumerate(ts):
+        o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+        if c is None or o is None or h is None or l is None:
+            continue
+        v = q["volume"][i]
+        out.append({"t": float(t), "o": float(o), "h": float(h),
+                    "l": float(l), "c": float(c),
+                    "v": float(v) if v else 0.0})
+    return out
+
+
+def fbf_signals(bars, VT, N):
+    """Python port of fadeSignals (signal side only). bars must be CLOSED.
+    Returns [{i, time, dir, D, SLd, atr}] for bars passing every filter."""
+    n = len(bars)
+    tr = []
+    for i, x in enumerate(bars):
+        if i:
+            pc = bars[i - 1]["c"]
+            tr.append(max(x["h"] - x["l"], abs(x["h"] - pc),
+                          abs(x["l"] - pc)))
+        else:
+            tr.append(max(x["h"] - x["l"], abs(x["h"] - x["c"])))
+    cs = [0.0]
+    vs = [0.0]
+    for i in range(n):
+        cs.append(cs[i] + tr[i])
+        vs.append(vs[i] + bars[i]["v"])
+    raw = [0] * n
+    for i in range(N, n):
+        x = bars[i]
+        t = time.gmtime(x["t"])
+        hr = t.tm_hour
+        dw = (t.tm_wday + 1) % 7  # JS getUTCDay(): Sun=0
+        if dw < 1 or dw > 5 or hr < 7 or hr >= 20 or i < 47:
+            continue
+        atr = (cs[i + 1] - cs[i - 47]) / 48
+        if not atr > 0:
+            continue
+        hh = -1e18
+        ll = 1e18
+        for k in range(i - N, i):
+            if bars[k]["h"] > hh:
+                hh = bars[k]["h"]
+            if bars[k]["l"] < ll:
+                ll = bars[k]["l"]
+        raw[i] = 1 if x["c"] > hh else (-1 if x["c"] < ll else 0)
+    out = []
+    for i in range(1440, n):
+        if not raw[i] or raw[i - 1]:
+            continue
+        v3 = (vs[i + 1] - vs[i - 2]) / 3
+        vm = (vs[i + 1] - vs[i - 1439]) / 1440
+        if not (vm > 0 and v3 / vm < VT):
+            continue
+        x = bars[i]
+        atr = (cs[i + 1] - cs[i - 47]) / 48
+        D = max(6 * atr, FBF_MIND)
+        out.append({"i": i, "time": x["t"] + 60, "dir": -raw[i],
+                    "D": D, "SLd": 0.5 * D, "atr": atr})
+    return out
+
+
+def _fbf_step(pos, y):
+    """Advance one position by one closed bar (stop-first, then TPs, then the
+    120-bar time stop). Returns the close reason or None."""
+    if y["t"] - pos["last_t"] > 600:
+        pos["gap"] = True
+    pos["last_t"] = y["t"]
+    pos["held"] += 1
+    d = pos["dir"]
+    lvl = pos["lvl"]
+    if (y["l"] <= pos["sl"]) if d > 0 else (y["h"] >= pos["sl"]):
+        return "sl"
+    while lvl < 3 and ((y["h"] >= pos["tps"][lvl]) if d > 0
+                       else (y["l"] <= pos["tps"][lvl])):
+        pos["fin"][lvl] = FBF_RV[lvl]
+        lvl += 1
+    pos["lvl"] = lvl
+    if lvl == 3:
+        return "tp3"
+    if pos["held"] >= FBF_W:
+        return "timestop"
+    return None
+
+
+def _fbf_close(pos, reason, last_bar):
+    """Finalize a position: fill remaining thirds, compute R, return the log
+    entry (marked skipped=gap if the trade window had a >600s bar gap)."""
+    lvl = pos["lvl"]
+    fin = pos["fin"]
+    d = pos["dir"]
+    SLd = pos["SLd"]
+    if reason == "sl":
+        for q in range(lvl, 3):
+            fin[q] = -1.0
+    else:
+        for q in range(3):
+            if fin[q] is None:
+                fin[q] = (last_bar["c"] - pos["entry"]) * d / SLd
+    base = {"v": pos["v"], "key": pos["key"], "sig_t": pos["sig_t"],
+            "dir": d, "entry_t": pos["e_t"], "entry": pos["entry"],
+            "sl": pos["sl"], "tp1": pos["tps"][0], "tp2": pos["tps"][1],
+            "tp3": pos["tps"][2], "atr48": round(pos["atr"], 3),
+            "D": round(pos["D"], 3), "exit_t": last_bar["t"],
+            "exit": reason, "tps": lvl, "held": pos["held"]}
+    if pos.get("gap"):
+        base["skipped"] = "gap"
+        return base
+    r = sum(fin) / 3.0
+    base["r_gross"] = round(r, 4)
+    base["r_net"] = round(r - FBF_SPREAD / SLd, 4)
+    return base
+
+
+def _fbf_walk(v, bars, now):
+    """Advance and close open positions of one variant over closed bars."""
+    for pos in list(v["positions"]):
+        for y in bars:
+            if y["t"] + 60 > now or y["t"] <= pos["last_t"]:
+                continue
+            done = _fbf_step(pos, y)
+            if not done:
+                continue
+            entry = _fbf_close(pos, done, y)
+            v["log"].append(entry)
+            if not entry.get("skipped"):
+                v["closed"] += 1
+                v["sum_r"] = round(v["sum_r"] + entry["r_gross"], 4)
+                v["sum_r_net"] = round(v["sum_r_net"] + entry["r_net"], 4)
+                v["mean_r"] = round(v["sum_r"] / v["closed"], 4)
+                v["mean_r_net"] = round(v["sum_r_net"] / v["closed"], 4)
+            v["positions"].remove(pos)
+            print("fbfade %s closed: %s %s r=%s net=%s%s"
+                  % (pos["v"], pos["key"], done,
+                     entry.get("r_gross"), entry.get("r_net"),
+                     " [skipped: gap]" if entry.get("skipped") else ""))
+            break
+
+
+def run_fbfade(state, now):
+    """Forward-test driver for both variants. Dry-run only: records signals,
+    entries and outcomes into state[FBF_KEY]; never sends anything."""
+    st = state.setdefault(FBF_KEY, {"started_at": now})
+    try:
+        bars = fetch_gcf_1m()
+    except Exception as e:
+        print("GC=F fetch failed (non-fatal):", repr(e), file=sys.stderr)
+        return
+    if len(bars) < 1600:
+        print("too few GC=F bars:", len(bars))
+        return
+    closed = [b for b in bars if b["t"] + 60 <= now]
+    by_t = {int(b["t"]): b for b in bars}
+    for name, VT, N in FBF_VARIANTS:
+        v = st.setdefault(name, {"signaled": [], "pending": {},
+                                 "positions": [], "log": [], "closed": 0,
+                                 "sum_r": 0.0, "sum_r_net": 0.0,
+                                 "mean_r": None, "mean_r_net": None})
+        try:
+            sigs = fbf_signals(closed, VT, N)
+        except Exception as e:
+            print("fbfade %s scan failed: %s" % (name, repr(e)),
+                  file=sys.stderr)
+            continue
+        if not st.get("inited_" + name):
+            # bootstrap: history is not a forward test - mark seen, log none
+            v["signaled"] = ["fb%s:%d:%d" % (name, s["time"] - 60, s["dir"])
+                             for s in sigs][-500:]
+            st["inited_" + name] = True
+            print("fbfade %s bootstrap: %d historical signals marked"
+                  % (name, len(v["signaled"])))
+            continue
+        # 1) open pendings whose entry bar now exists in the feed
+        for key in list(v["pending"].keys()):
+            p = v["pending"][key]
+            eb = by_t.get(int(p["e_t"]))
+            if eb is None:
+                if now - p["e_t"] > 900:  # entry bar never showed: gap
+                    v["log"].append({"v": name, "key": key,
+                                     "sig_t": p["sig_t"], "dir": p["dir"],
+                                     "skipped": "entry_gap"})
+                    del v["pending"][key]
+                continue
+            d = p["dir"]
+            ep = eb["o"]
+            SLd = p["SLd"]
+            v["positions"].append({
+                "v": name, "key": key, "sig_t": p["sig_t"], "e_t": p["e_t"],
+                "dir": d, "entry": ep, "sl": ep - d * SLd,
+                "tps": [ep + d * p["D"], ep + d * 2 * p["D"],
+                        ep + d * 3 * p["D"]],
+                "D": p["D"], "SLd": SLd, "atr": p["atr"],
+                "lvl": 0, "fin": [None, None, None],
+                "held": 0, "last_t": p["e_t"] - 60, "gap": False})
+            del v["pending"][key]
+            print("fbfade %s entry: %s dir=%d @ %.2f D=%.2f"
+                  % (name, key, d, ep, p["D"]))
+        # 2) register new signals as pending
+        for s in sigs:
+            key = "fb%s:%d:%d" % (name, s["time"] - 60, s["dir"])
+            if key in v["signaled"]:
+                continue
+            v["signaled"].append(key)
+            v["pending"][key] = {"sig_t": s["time"], "e_t": s["time"],
+                                 "dir": s["dir"], "D": s["D"],
+                                 "SLd": s["SLd"], "atr": s["atr"]}
+        v["signaled"] = v["signaled"][-500:]
+        # 3) advance open positions
+        _fbf_walk(v, bars, now)
+        v["log"] = v["log"][-400:]
+
 # ------------------------------------------------------------------ main
 
 GH_PAT = os.environ.get("GH_PAT", "").strip()
@@ -1319,9 +1561,15 @@ def main():
         sent, telegram_down = run_ml(state, now, sent, telegram_down)
     except Exception as e:
         print("ML run failed (non-fatal):", repr(e), file=sys.stderr)
+    fbf_before = json.dumps(state.get(FBF_KEY), sort_keys=True)
+    try:
+        run_fbfade(state, now)
+    except Exception as e:
+        print("fbfade run failed (non-fatal):", repr(e), file=sys.stderr)
     if (fetches_done or sent
             or json.dumps(state.get(SCALP_KEY), sort_keys=True) != scalp_before
-            or json.dumps(state.get(ML_KEY), sort_keys=True) != ml_before):
+            or json.dumps(state.get(ML_KEY), sort_keys=True) != ml_before
+            or json.dumps(state.get(FBF_KEY), sort_keys=True) != fbf_before):
         save_state(state)
     else:
         print("no state changes; skipping save")
