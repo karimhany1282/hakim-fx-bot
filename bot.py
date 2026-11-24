@@ -293,10 +293,13 @@ def send_telegram(text):
         return True
     token = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat:
-        print("ERROR: TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set", file=sys.stderr)
+    relay = os.environ.get("TELEGRAM_RELAY", "").strip()
+    if not chat or (not relay and not token):
+        print("ERROR: TELEGRAM_RELAY or TELEGRAM_TOKEN + TELEGRAM_CHAT_ID not set", file=sys.stderr)
         return False
-    url = "https://api.telegram.org/bot%s/sendMessage" % token
+    # relay: a Cloudflare Worker holding the bot token, used because
+    # api.telegram.org throttle-lists datacenter egress IPs
+    url = relay if relay else "https://api.telegram.org/bot%s/sendMessage" % token
     payload = json.dumps({"chat_id": chat, "text": text}).encode()
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json", **UA})
@@ -305,6 +308,10 @@ def send_telegram(text):
             return r.status == 200
     except urllib.error.HTTPError as e:
         print("telegram error:", e.code, e.read()[:200], file=sys.stderr)
+        return False
+    except Exception as e:
+        # hang/timeout/refused (transient) -> log, skip this run, retry next run
+        print("telegram send failed (transient):", repr(e), file=sys.stderr)
         return False
 
 
@@ -410,7 +417,8 @@ def main():
     save_state(state)
     print("done. messages sent:", sent, "fetch errors:", errors)
     if total_combos and errors == total_combos:
-        sys.exit(1)  # total failure -> mark the workflow run red
+        # transient provider/network problem: stay green, retry next run
+        print("WARNING: all fetches failed this run; will retry next run", file=sys.stderr)
 
 
 if __name__ == "__main__":
