@@ -888,6 +888,8 @@ def run_scalp(state, now, sent, telegram_down):
 # Geometry: SL = 1.5*ATR(14), TP1/2/3 = 2x/3x/4x the SL distance; the shared
 # position tracker moves SL to entry after TP1, like the other gold signals.
 ML_KEY = "XAUUSD_ml"
+ML_LIVE = False  # HELD by parent 24 Nov 14:13 EET: dry-run only (evaluate +
+# record every signal, never send) until revalidated on real XAUUSD data.
 ML_W = [-0.004795361647470501, -0.006931398440520428, -0.00814816486513296, -0.011991680176664138, -0.025593175199036068, -0.0312814957322029, 0.011097220773312867, 0.049259037989981116, 0.005855442604092558, 0.009182156240966148, 0.013608390281354254, -0.0013089628711275949, -0.0071497412161657045, 0.016460904622307006, -0.004638415863337652, 0.013888862390991122, 0.01691248758555308, -0.009212230324969536, 0.0010324959888403731, 0.007083511794288525, 0.009676707989731716, 0.00015151266155998916]
 ML_MU = [-0.3874469449515239, -0.4689251123252492, -0.47291956920334227, -0.4131589991939655, -0.21745905774264931, -0.17835113678758882, 2.8748773841928283, 5.254585920771126, 0.9313663159509391, 0.9773738174158573, 0.18804528268597603, -0.3238014244960126, -0.07357367655162507, 0.028524279985362656, 0.009202192645398167, 1.4253360559752943, 0.05422577239131433, 0.25863287885047975, 0.008474498462103476, 0.04469540467336914, 0.10865353716200707, 0.7137951613643667]
 ML_SD = [0.7592704528855888, 0.9451281139834996, 1.1358379123325981, 1.534109962534404, 2.078459237332209, 1.2161657688710972, 4.293466346130285, 9.957192062754034, 0.4414267190454469, 0.790324949284703, 0.3319663047182797, 0.5276914475228933, 0.3098760471825951, 0.7168416962720339, 0.6965914659358765, 1.4790278451582675, 0.22646266458903755, 0.43788344762465303, 0.09166614162961118, 0.20663428052434085, 0.31120402736245256, 0.45198631603302175]
@@ -1042,6 +1044,23 @@ def run_ml(state, now, sent, telegram_down):
     sc = state.setdefault(SCALP_KEY, {"scalp_v": SCALP_V, "last_time": 0,
                                       "signaled": [], "msg_ids": {},
                                       "positions": {}})
+    if not ML_LIVE:
+        suffix = ":%d:%d" % (bar_t, s["d"])
+        suppressed = (any(k.endswith(suffix) for k in sc["signaled"])
+                      or any(p.get("dir") == -s["d"]
+                             for p in sc["positions"].values()))
+        dry = st.setdefault("dry", [])
+        dry.append({"key": key, "time": bar_t + 300, "dir": s["d"],
+                    "score": round(s["score"], 4),
+                    "dist": round(s["dist"], 3),
+                    "paxg_close": bars[s["i"]]["c"],
+                    "would_suppress": suppressed})
+        st["dry"] = dry[-200:]
+        st["last_bar"] = bar_t
+        print("ML DRY-RUN signal (not sent): %s score %.3f dist %.2f%s"
+              % (key, s["score"], s["dist"],
+                 " [would be suppressed]" if suppressed else ""))
+        return sent, telegram_down
     if key in sc["signaled"]:
         st["last_bar"] = bar_t
         return sent, telegram_down
