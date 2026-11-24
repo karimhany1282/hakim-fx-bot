@@ -450,6 +450,24 @@ BE_TEXTS = [
 SCALP_TP1_SUFFIX = "\n\U0001F6E1\uFE0F الستوب دلوقتي على الدخول"
 
 
+def xau_open_ts(ts):
+    """Spot gold (XAUUSD) trades Sun 23:00 UTC to Fri 22:00 UTC. PAXG ticks
+    24/7; outside these hours its moves are thin-market noise TradingView
+    XAUUSD would never show, so no signals or touch checks then."""
+    t = time.gmtime(ts)
+    if t.tm_wday == 5:
+        return False                      # Saturday
+    if t.tm_wday == 6 and t.tm_hour < 23:
+        return False                      # Sunday before 23:00 UTC
+    if t.tm_wday == 4 and t.tm_hour >= 22:
+        return False                      # Friday from 22:00 UTC
+    return True
+
+
+def xau_open():
+    return xau_open_ts(time.time())
+
+
 def fetch_paxg_5m(limit=1000):
     """Closed weekday 5m PAXG bars, oldest first: [{t,o,h,l,c}, ...].
     Always 3000 bars like the page engine: the 576-bar volatility-ratio
@@ -468,8 +486,9 @@ def fetch_paxg_5m(limit=1000):
         if not k or len(k) < limit:  # raw page size; the open bar is filtered above
             break
         end = int(batch[0]["t"] * 1000) - 1
-    # weekday filter (Mon-Fri UTC), exactly like the page engine
-    return [b for b in out if time.gmtime(b["t"]).tm_wday <= 4]
+    # keep only bars from spot-gold market hours: PAXG weekend bars are
+    # thin-market artifacts XAUUSD never trades at
+    return [b for b in out if xau_open_ts(b["t"])]
 
 
 def fetch_paxg_ticker():
@@ -729,10 +748,14 @@ def run_scalp(state, now, sent, telegram_down):
     for e in entries:
         groups.setdefault((int(bars[e["bar_i"]]["t"]), e["dir"]), []).append(e)
     quote_dead = False
+    market_open = xau_open()
     for gkey in sorted(groups):
         evs = groups[gkey]
         rep = next((e for e in evs if e["rule"] == "sweep"), evs[0])
         if any(e["key"] in st["signaled"] for e in evs):
+            continue
+        if not market_open:
+            # spot gold closed (Fri 22:00-Sun 23:00 UTC): never post entries
             continue
         if sent >= MAX_MESSAGES_PER_RUN or telegram_down or quote_dead:
             break
@@ -799,7 +822,7 @@ def run_scalp(state, now, sent, telegram_down):
                 break
     # --- live intra-bar touch check: walk recent 1m bars (incl. the forming
     # one) oldest-first, then the live tick; stop before TP within a bar ---
-    if st["positions"]:
+    if st["positions"] and xau_open():
         try:
             probe = fetch_paxg_1m(8)
             tick = fetch_paxg_ticker()
