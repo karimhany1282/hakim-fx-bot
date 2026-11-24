@@ -1158,7 +1158,8 @@ FBF_KEY = "XAU_fbfade"
 FBF_W = 120                 # time stop, bars (entry bar included)
 FBF_MIND = 4.0              # D floor in USD, per task spec
 FBF_SPREAD = 0.25           # USD per trade, for net R
-FBF_VARIANTS = (("A", 2.0, 120), ("B", 1.5, 144))
+FBF_VARIANTS = (("A", 2.0, 120, None), ("B", 1.5, 144, None),
+                ("C", 1.3, 240, 8.0))  # (name, vol thr, N, fixed D or None)
 FBF_RV = (2.0, 4.0, 6.0)    # R per third at TP1/2/3 (D / 0.5D)
 GCF_CHART = ("https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
              "?interval=1m&range=5d")
@@ -1184,8 +1185,9 @@ def fetch_gcf_1m():
     return out
 
 
-def fbf_signals(bars, VT, N):
+def fbf_signals(bars, VT, N, fixed_D=None):
     """Python port of fadeSignals (signal side only). bars must be CLOSED.
+    fixed_D overrides the ATR-based D (variant C: fixed $8 TP1 / $4 SL).
     Returns [{i, time, dir, D, SLd, atr}] for bars passing every filter."""
     n = len(bars)
     tr = []
@@ -1230,7 +1232,7 @@ def fbf_signals(bars, VT, N):
             continue
         x = bars[i]
         atr = (cs[i + 1] - cs[i - 47]) / 48
-        D = max(6 * atr, FBF_MIND)
+        D = fixed_D if fixed_D else max(6 * atr, FBF_MIND)
         out.append({"i": i, "time": x["t"] + 60, "dir": -raw[i],
                     "D": D, "SLd": 0.5 * D, "atr": atr})
     return out
@@ -1327,13 +1329,13 @@ def run_fbfade(state, now):
         return
     closed = [b for b in bars if b["t"] + 60 <= now]
     by_t = {int(b["t"]): b for b in bars}
-    for name, VT, N in FBF_VARIANTS:
+    for name, VT, N, fixed_D in FBF_VARIANTS:
         v = st.setdefault(name, {"signaled": [], "pending": {},
                                  "positions": [], "log": [], "closed": 0,
                                  "sum_r": 0.0, "sum_r_net": 0.0,
                                  "mean_r": None, "mean_r_net": None})
         try:
-            sigs = fbf_signals(closed, VT, N)
+            sigs = fbf_signals(closed, VT, N, fixed_D)
         except Exception as e:
             print("fbfade %s scan failed: %s" % (name, repr(e)),
                   file=sys.stderr)
