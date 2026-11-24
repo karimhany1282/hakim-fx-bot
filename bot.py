@@ -472,6 +472,12 @@ def fetch_paxg_5m(limit=1000):
     return [b for b in out if time.gmtime(b["t"]).tm_wday <= 4]
 
 
+def fetch_paxg_ticker():
+    """Live PAXG price (Binance, free, real-time) for intra-bar touch checks."""
+    data = _get_json("https://data-api.binance.vision/api/v3/ticker/price?symbol=PAXGUSDT")
+    return float(data["price"])
+
+
 def _ema(a, n):
     k = 2.0 / (n + 1)
     o = []
@@ -727,6 +733,7 @@ def run_scalp(state, now, sent, telegram_down):
             "tps_p": [tp - basis for tp in tps],
             "sig_bar_t": int(bars[rep["bar_i"]]["t"]),
             "sig_bar_i": rep["bar_i"],
+            "tps_hit": 0,
         }
         sent += 1
         time.sleep(0.3)
@@ -752,13 +759,55 @@ def run_scalp(state, now, sent, telegram_down):
                 telegram_down = True
                 break
             st["signaled"].append(ekey)
+            if ev["kind"].startswith("tp"):
+                pos["tps_hit"] = max(pos.get("tps_hit", 0), int(ev["kind"][2]))
             sent += 1
             time.sleep(0.3)
             if ev["kind"] in ("sl", "be", "tp3"):
                 del st["positions"][pkey]
                 break
+    # --- live intra-bar touch check (1-min cron): stop first, then next TP ---
+    if st["positions"]:
+        try:
+            live_paxg = fetch_paxg_ticker()
+        except Exception as e:
+            live_paxg = None
+            print("PAXG ticker failed (non-fatal):", repr(e), file=sys.stderr)
+        if live_paxg is not None:
+            for pkey in list(st["positions"].keys()):
+                pos = st["positions"][pkey]
+                d = pos["dir"]
+                n_tp = pos.get("tps_hit", 0)
+                stop = pos["sl_p"] if n_tp == 0 else pos["entry_p"]
+                hit_stop = live_paxg <= stop if d > 0 else live_paxg >= stop
+                ev = None
+                if hit_stop:
+                    kind = "sl" if n_tp == 0 else "be"
+                    if pkey + ":" + kind not in st["signaled"]:
+                        ev = {"kind": kind, "bar_i": None}
+                elif n_tp < 3:
+                    tp = pos["tps_p"][n_tp]
+                    hit_tp = live_paxg >= tp if d > 0 else live_paxg <= tp
+                    kind = "tp%d" % (n_tp + 1)
+                    if hit_tp and pkey + ":" + kind not in st["signaled"]:
+                        ev = {"kind": kind, "bar_i": None}
+                if ev is None:
+                    continue
+                if sent >= MAX_MESSAGES_PER_RUN or telegram_down:
+                    break
+                reply_to = st["msg_ids"].get(pkey)
+                mid = send_telegram(build_scalp_outcome(pos, ev), reply_to=reply_to)
+                if not mid:
+                    telegram_down = True
+                    break
+                st["signaled"].append(pkey + ":" + ev["kind"])
+                if ev["kind"].startswith("tp"):
+                    pos["tps_hit"] = max(n_tp, int(ev["kind"][2]))
+                sent += 1
+                time.sleep(0.3)
+                if ev["kind"] in ("sl", "be", "tp3"):
+                    del st["positions"][pkey]
     st["signaled"] = st["signaled"][-1500:]
-    st["last_time"] = bars[-1]["t"]
     ids = st["msg_ids"]
     st["msg_ids"] = dict(list(ids.items())[-200:])
     print("scalp: %d bars, %d entries in window, %d open positions, sent so far %d"
@@ -926,11 +975,16 @@ def main():
             print("%s: %d bars, %d total events, sent so far %d"
                   % (key, len(bars), len(events), sent))
             time.sleep(1)  # be gentle with the data provider
+    scalp_before = json.dumps(state.get(SCALP_KEY), sort_keys=True)
     try:
         sent, telegram_down = run_scalp(state, now, sent, telegram_down)
     except Exception as e:
         print("scalp run failed (non-fatal):", repr(e), file=sys.stderr)
-    save_state(state)
+    if (fetches_done or sent
+            or json.dumps(state.get(SCALP_KEY), sort_keys=True) != scalp_before):
+        save_state(state)
+    else:
+        print("no state changes; skipping save")
     print("done. messages sent:", sent, "fetch errors:", errors)
     if total_combos and errors == total_combos:
         # transient provider/network problem: stay green, retry next run
