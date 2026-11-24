@@ -434,7 +434,32 @@ def build_message(sym, tf, ev):
 
 # ------------------------------------------------------------------ main
 
+GH_PAT = os.environ.get("GH_PAT", "").strip()
+GH_REPO = os.environ.get("GH_REPO", "").strip()  # owner/name; state.json lives there
+
+
+def _gh_api(method, path, body=None):
+    req = urllib.request.Request(
+        "https://api.github.com" + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": "Bearer " + GH_PAT,
+                 "Accept": "application/vnd.github+json",
+                 "Content-Type": "application/json", **UA},
+        method=method)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
 def load_state():
+    if GH_PAT and GH_REPO:
+        # serverless mode: state.json lives in the GitHub repo
+        try:
+            d = _gh_api("GET", "/repos/%s/contents/state.json" % GH_REPO)
+            import base64
+            return json.loads(base64.b64decode(d["content"]).decode())
+        except Exception as e:
+            print("state load from github failed: %s" % e, file=sys.stderr)
+            return {}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -443,6 +468,20 @@ def load_state():
 
 
 def save_state(state):
+    if GH_PAT and GH_REPO:
+        import base64
+        try:
+            cur = _gh_api("GET", "/repos/%s/contents/state.json" % GH_REPO)
+            _gh_api("PUT", "/repos/%s/contents/state.json" % GH_REPO, {
+                "message": "state update",
+                "content": base64.b64encode(
+                    json.dumps(state).encode()).decode(),
+                "sha": cur["sha"],
+            })
+        except Exception as e:
+            # losing a state save only re-runs deduped events next time
+            print("state save to github failed: %s" % e, file=sys.stderr)
+        return
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f)
 
@@ -452,10 +491,16 @@ def main():
     sent = 0
     telegram_down = False
     errors = 0
+    fetches_done = 0
     td_gate = PROVIDER == "twelvedata"
     now = time.time()
     fetch_log = state.setdefault("__fetch__", {})
     total_combos = 0
+    # fair scheduling under Twelve Data's 8-credits/min free cap and the
+    # 60s serverless ceiling: least-recently-fetched combos first, at most
+    # FETCH_BUDGET fetches per run; the rest stay due and go first next run
+    FETCH_BUDGET = 7
+    candidates = []
     for sym in SYMBOLS:
         for tf in TIMEFRAMES:
             key = "%s_%s" % (sym, tf)
@@ -466,13 +511,19 @@ def main():
                     # skip them on the credit-capped free tier
                     continue
                 if sec > 900 and now - fetch_log.get(key, 0) < sec - 120:
-                    # free tier budget: fetch 1h/4h only when due (~126
-                    # credits/symbol/day -> 6 symbols fits in 800/day)
+                    # free tier budget: fetch 1h/4h only when due
                     continue
+            candidates.append((sym, tf, key))
+    candidates.sort(key=lambda c: fetch_log.get(c[2], 0))
+    for sym, tf, key in candidates:
+            if td_gate and fetches_done >= FETCH_BUDGET:
+                print("credit budget reached; deferring %s to next run" % key)
+                continue
             total_combos += 1
             try:
                 bars = fetch_bars(sym, tf)
                 fetch_log[key] = now
+                fetches_done += 1
             except Exception as e:
                 errors += 1
                 print("fetch failed %s: %s" % (key, e), file=sys.stderr)
