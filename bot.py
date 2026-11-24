@@ -69,7 +69,7 @@ MIN_STOP_PIPS = {                   # volatility floor per pair, in pips
     "XAUUSD": 25.0,                 # pip = 0.1 -> 25 pips = $2.50
 }
 MAX_ZONES = 1000
-ENGINE_V = 2  # bump when event keys/levels change -> silent re-bootstrap
+ENGINE_V = 3  # bump when event keys/levels change -> silent re-bootstrap
 STATE_FILE = "state.json"
 MAX_MESSAGES_PER_RUN = 25
 
@@ -412,10 +412,8 @@ def build_message(sym, tf, ev):
         head = _variant(ev["key"] + "h", heads)
         tpl = _variant(ev["key"] + "t", ENTRY_HEADS)
         block = _variant(ev["key"] + "b", ENTRY_BLOCKS)
-        tfline = _variant(ev["key"] + "f", TF_LINES) % tf
         lines = [
             tpl % (head, sym, fmt_price(ev["entry"], pip)),
-            tfline,
             "",
             block[0] % fmt_price(ev["tps"][0], pip),
             block[1] % fmt_price(ev["tps"][1], pip),
@@ -430,6 +428,342 @@ def build_message(sym, tf, ev):
         return tpl % (fmt_price(ev["price"], pip), _fmt_pips(abs(pips)))
     tpl = _variant(ev["key"] + "o", SL_TEXTS)
     return tpl % (fmt_price(ev["price"], pip), _fmt_pips(abs(pips)))
+
+
+
+# ------------------------------------------------------------------ gold scalp
+# Gold scalp engine v2 (same rules as https://hakim-gold.vercel.app), on closed
+# 5m PAXG bars from Binance (free, no key). Patterns are basis-insensitive;
+# posted levels are offsets from the LIVE XAUUSD price at send time (Twelve
+# Data quote, ~1 credit per entry), never raw PAXG prices (PAXG trades ~$17
+# below spot). Touch detection reuses the stored constant basis so PAXG bars
+# can be checked against XAU-referenced levels.
+SCALP_KEY = "XAUUSD_scalp"
+SCALP_V = 1
+SCALP_STALE_SEC = 1800          # "buy now" wording: never post a scalp >30 min old
+BINANCE_KLINES = "https://data-api.binance.vision/api/v3/klines?symbol=PAXGUSDT&interval=5m"
+
+BE_TEXTS = [
+    "\U0001F6E1\uFE0F الستوب كان على الدخول وخرجنا على التعادل 🤍 (%s)\n0 نقطة",
+    "\U0001F6E1\uFE0F خرجنا على التعادل بعد ما الستوب اتحرك للدخول 🤲 (%s)\n0 نقطة",
+]
+SCALP_TP1_SUFFIX = "\n\U0001F6E1\uFE0F الستوب دلوقتي على الدخول"
+
+
+def fetch_paxg_5m(limit=1000):
+    """Closed weekday 5m PAXG bars, oldest first: [{t,o,h,l,c}, ...].
+    Always 3000 bars like the page engine: the 576-bar volatility-ratio
+    window plus weekend gaps need the depth."""
+    out = []
+    end = None
+    for _ in range(3):
+        url = BINANCE_KLINES + "&limit=%d" % limit
+        if end:
+            url += "&endTime=%d" % end
+        k = _get_json(url)
+        now_ms = time.time() * 1000
+        batch = [{"t": x[0] / 1000.0, "o": float(x[1]), "h": float(x[2]),
+                  "l": float(x[3]), "c": float(x[4])} for x in k if x[6] < now_ms]
+        out = batch + out
+        if not k or len(k) < limit:  # raw page size; the open bar is filtered above
+            break
+        end = int(batch[0]["t"] * 1000) - 1
+    # weekday filter (Mon-Fri UTC), exactly like the page engine
+    return [b for b in out if time.gmtime(b["t"]).tm_wday <= 4]
+
+
+def _ema(a, n):
+    k = 2.0 / (n + 1)
+    o = []
+    p = a[0]
+    for i, x in enumerate(a):
+        p = x * k + p * (1 - k) if i else a[0]
+        o.append(p)
+    return o
+
+
+def _atr_sma(b, n=14):
+    tr = []
+    for i, x in enumerate(b):
+        if i:
+            pc = b[i - 1]["c"]
+            tr.append(max(x["h"] - x["l"], abs(x["h"] - pc), abs(x["l"] - pc)))
+        else:
+            tr.append(x["h"] - x["l"])
+    return [sum(tr[i - n + 1:i + 1]) / n if i >= n - 1 else 0.0
+            for i in range(len(tr))]
+
+
+def _wilder(a, n):
+    k = 1.0 / n
+    o = []
+    p = a[0]
+    for i, x in enumerate(a):
+        p = x * k + p * (1 - k) if i else a[0]
+        o.append(p)
+    return o
+
+
+def _rsi2(c):
+    d = [c[i] - c[i - 1] if i else 0.0 for i in range(len(c))]
+    u = _wilder([max(x, 0.0) for x in d], 2)
+    w = _wilder([max(-x, 0.0) for x in d], 2)
+    return [100.0 - 100.0 / (1.0 + u[i] / (w[i] + 1e-12)) for i in range(len(c))]
+
+
+def scalp_entries(bars):
+    """All entry signals in the window, both rules, chronological.
+    Returns [{key, rule, dir, bar_i, sig_time, s}]."""
+    c = [x["c"] for x in bars]
+    e200 = _ema(c, 200)
+    a = _atr_sma(bars)
+    r = _rsi2(c)
+    am576 = [sum(a[i - 575:i + 1]) / 576.0 if i >= 576 + 13 else float("nan")
+             for i in range(len(a))]
+    out = []
+    for kind, mult in (("sweep", 0.75), ("rsi2", 1.0)):
+        last = {}
+        N = 12
+        for i in range(max(200, N + 1, 600), len(bars)):
+            x = bars[i]
+            if not a[i] > 0:
+                continue
+            vr = a[i] / am576[i]
+            if kind == "sweep" and not vr < 0.8:
+                continue
+            if kind == "rsi2" and not vr < 1.0:
+                continue
+            d = 0
+            if kind == "sweep":
+                hh = max(y["h"] for y in bars[i - N:i])
+                ll = min(y["l"] for y in bars[i - N:i])
+                if x["h"] > hh and c[i] < hh and c[i] < x["o"]:
+                    d = -1
+                if x["l"] < ll and c[i] > ll and c[i] > x["o"]:
+                    d = 1
+            else:
+                if r[i] < 20 and c[i] > e200[i] and c[i] > x["o"]:
+                    d = 1
+                if r[i] > 80 and c[i] < e200[i] and c[i] < x["o"]:
+                    d = -1
+            if not d:
+                continue
+            if i - last.get(d, -99) < 3:
+                continue
+            last[d] = i
+            out.append({
+                "key": "sc:%s:%d:%d" % (kind, int(x["t"]), d),
+                "rule": kind, "dir": d, "bar_i": i,
+                "sig_time": x["t"] + 300, "s": a[i] * mult,
+            })
+    out.sort(key=lambda e: (e["sig_time"], e["rule"]))
+    return out
+
+
+def resolve_scalp_position(pos, bars):
+    """Walk closed PAXG bars against the position's basis-locked levels.
+    Same resolution rules as the page engine: SL beats TP1 on the same bar;
+    after TP1 the stop moves to entry (checked from the next bar); TP<=BE
+    same-bar counts the TP. Returns [{kind, bar_i}] chronological."""
+    d = pos["dir"]
+    sl = pos["sl_p"]; entry = pos["entry_p"]; tps = pos["tps_p"]
+    INF = float("inf")
+    tsl = t1 = t2 = t3 = INF
+    start = pos["sig_bar_i"] + 1
+    hit_l = lambda y, p: y["h"] >= p if d > 0 else y["l"] <= p
+    hit_s = lambda y: y["l"] <= sl if d > 0 else y["h"] >= sl
+    for j in range(start, len(bars)):
+        y = bars[j]
+        if tsl == INF and hit_s(y):
+            tsl = j
+        if t1 == INF and hit_l(y, tps[0]):
+            t1 = j
+        if t2 == INF and hit_l(y, tps[1]):
+            t2 = j
+        if t3 == INF and hit_l(y, tps[2]):
+            t3 = j
+    evs = []
+    if tsl < INF and tsl <= t1:
+        evs.append({"kind": "sl", "bar_i": tsl})
+    elif t1 < INF:
+        tbe = INF
+        for j in range(int(t1) + 1, len(bars)):
+            y = bars[j]
+            if (y["l"] <= entry) if d > 0 else (y["h"] >= entry):
+                tbe = j
+                break
+        evs.append({"kind": "tp1", "bar_i": t1})
+        if t2 <= tbe and t2 < INF:
+            evs.append({"kind": "tp2", "bar_i": t2})
+        if t3 <= tbe and t3 < INF:
+            evs.append({"kind": "tp3", "bar_i": t3})
+        if tbe < INF and tbe < t3:
+            evs.append({"kind": "be", "bar_i": tbe})
+    order = {"tp1": 1, "tp2": 2, "tp3": 3, "be": 4, "sl": 5}
+    evs.sort(key=lambda e: (e["bar_i"], order[e["kind"]]))
+    return evs
+
+
+def td_quote_xau():
+    """Live XAU/USD price from Twelve Data (~1 credit), or None."""
+    key = os.environ.get("TWELVEDATA_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        data = _get_json("https://api.twelvedata.com/quote?symbol=XAU/USD&apikey=" + key)
+        if isinstance(data, dict) and data.get("status") == "error":
+            print("TD quote error:", data.get("message"), file=sys.stderr)
+            return None
+        return float(data["close"])
+    except Exception as e:
+        print("TD quote failed:", repr(e), file=sys.stderr)
+        return None
+
+
+def build_scalp_entry(dir_, entry, tps, sl, key):
+    pip = SYMBOLS["XAUUSD"]["pip"]
+    heads = ENTRY_BUY if dir_ == 1 else ENTRY_SELL
+    head = _variant(key + "h", heads)
+    tpl = _variant(key + "t", ENTRY_HEADS)
+    block = _variant(key + "b", ENTRY_BLOCKS)
+    lines = [
+        tpl % (head, "XAUUSD", fmt_price(entry, pip)),
+        "",
+        block[0] % fmt_price(tps[0], pip),
+        block[1] % fmt_price(tps[1], pip),
+        block[2] % fmt_price(tps[2], pip),
+        block[3] % fmt_price(sl, pip),
+    ]
+    return "\n".join(lines)
+
+
+def build_scalp_outcome(pos, ev):
+    pip = SYMBOLS["XAUUSD"]["pip"]
+    key = pos["entry_key"]
+    kind = ev["kind"]
+    if kind == "sl":
+        price = pos["sl_xau"]
+    elif kind == "be":
+        price = pos["entry_xau"]
+    else:
+        price = pos["tps_xau"][int(kind[2]) - 1]
+    if kind in ("tp1", "tp2", "tp3"):
+        n = int(kind[2])
+        tpl = _variant(key + "o", TP_TEXTS[n])
+        pips = abs(price - pos["entry_xau"]) / pip
+        msg = tpl % (fmt_price(price, pip), _fmt_pips(pips))
+        if n == 1:
+            msg += SCALP_TP1_SUFFIX
+        return msg
+    if kind == "be":
+        return _variant(key + "o", BE_TEXTS) % fmt_price(price, pip)
+    tpl = _variant(key + "o", SL_TEXTS)
+    pips = abs(price - pos["entry_xau"]) / pip
+    return tpl % (fmt_price(price, pip), _fmt_pips(pips))
+
+
+def run_scalp(state, now, sent, telegram_down):
+    """Gold scalp on 5m PAXG; returns (sent, telegram_down)."""
+    st = state.setdefault(SCALP_KEY, {"scalp_v": 0, "last_time": 0,
+                                      "signaled": [], "msg_ids": {},
+                                      "positions": {}})
+    bootstrap = st.get("scalp_v") != SCALP_V or not st.get("last_time")
+    try:
+        bars = fetch_paxg_5m()
+    except Exception as e:
+        print("PAXG fetch failed:", repr(e), file=sys.stderr)
+        return sent, telegram_down
+    if len(bars) < 1500:
+        print("too few PAXG bars:", len(bars))
+        return sent, telegram_down
+    entries = scalp_entries(bars)
+    if bootstrap:
+        st["signaled"] = [e["key"] for e in entries][-1500:]
+        st["positions"] = {}
+        st["last_time"] = bars[-1]["t"]
+        st["scalp_v"] = SCALP_V
+        print("bootstrap %s (scalp v%d): %d bars, %d known entries"
+              % (SCALP_KEY, SCALP_V, len(bars), len(entries)))
+        return sent, telegram_down
+    # locate each stored position's signal bar in this window
+    t_index = {int(b["t"]): i for i, b in enumerate(bars)}
+    # --- new entries ---
+    groups = {}
+    for e in entries:
+        groups.setdefault((int(bars[e["bar_i"]]["t"]), e["dir"]), []).append(e)
+    quote_dead = False
+    for gkey in sorted(groups):
+        evs = groups[gkey]
+        rep = next((e for e in evs if e["rule"] == "sweep"), evs[0])
+        if any(e["key"] in st["signaled"] for e in evs):
+            continue
+        if sent >= MAX_MESSAGES_PER_RUN or telegram_down or quote_dead:
+            break
+        if now - rep["sig_time"] > SCALP_STALE_SEC:
+            for e in evs:
+                st["signaled"].append(e["key"])
+            continue
+        live = td_quote_xau()
+        if live is None:
+            quote_dead = True
+            print("XAU quote unavailable; deferring scalp entries", file=sys.stderr)
+            continue
+        d = rep["dir"]; s_ = rep["s"]
+        basis = live - bars[rep["bar_i"]]["c"]
+        entry = live
+        sl = entry - d * s_
+        tps = [entry + d * 2 * s_, entry + d * 3 * s_, entry + d * 4 * s_]
+        mid = send_telegram(build_scalp_entry(d, entry, tps, sl, rep["key"]))
+        if not mid:
+            telegram_down = True
+            continue
+        for e in evs:
+            st["signaled"].append(e["key"])
+        st["msg_ids"][rep["key"]] = mid
+        st["positions"][rep["key"]] = {
+            "entry_key": rep["key"], "dir": d, "rule": rep["rule"],
+            "s": s_, "entry_xau": entry, "sl_xau": sl, "tps_xau": tps,
+            "entry_p": entry - basis, "sl_p": sl - basis,
+            "tps_p": [tp - basis for tp in tps],
+            "sig_bar_t": int(bars[rep["bar_i"]]["t"]),
+            "sig_bar_i": rep["bar_i"],
+        }
+        sent += 1
+        time.sleep(0.3)
+    # --- outcomes for open positions ---
+    for pkey in list(st["positions"].keys()):
+        pos = st["positions"][pkey]
+        i0 = t_index.get(pos["sig_bar_t"])
+        if i0 is None:
+            # signal bar aged out of the fetch window; stop tracking
+            print("scalp position aged out of window:", pkey)
+            del st["positions"][pkey]
+            continue
+        pos["sig_bar_i"] = i0
+        for ev in resolve_scalp_position(pos, bars):
+            ekey = pkey + ":" + ev["kind"]
+            if ekey in st["signaled"]:
+                continue
+            if sent >= MAX_MESSAGES_PER_RUN or telegram_down:
+                break
+            reply_to = st["msg_ids"].get(pkey)
+            mid = send_telegram(build_scalp_outcome(pos, ev), reply_to=reply_to)
+            if not mid:
+                telegram_down = True
+                break
+            st["signaled"].append(ekey)
+            sent += 1
+            time.sleep(0.3)
+            if ev["kind"] in ("sl", "be", "tp3"):
+                del st["positions"][pkey]
+                break
+    st["signaled"] = st["signaled"][-1500:]
+    st["last_time"] = bars[-1]["t"]
+    ids = st["msg_ids"]
+    st["msg_ids"] = dict(list(ids.items())[-200:])
+    print("scalp: %d bars, %d entries in window, %d open positions, sent so far %d"
+          % (len(bars), len(entries), len(st["positions"]), sent))
+    return sent, telegram_down
 
 
 # ------------------------------------------------------------------ main
@@ -507,11 +841,12 @@ def main():
             if td_gate:
                 sec = TIMEFRAMES[tf]["sec"]
                 if sec < 900:
-                    # sub-15m TFs can't be honored at a 15-min cron cadence;
-                    # skip them on the credit-capped free tier
+                    # sub-15m TFs can't be honored on the credit-capped free
+                    # tier; the gold scalp gets its 5m bars from Binance
                     continue
-                if sec > 900 and now - fetch_log.get(key, 0) < sec - 120:
-                    # free tier budget: fetch 1h/4h only when due
+                if now - fetch_log.get(key, 0) < sec - 120:
+                    # free tier budget: fetch each TF only when due (the cron
+                    # runs every 5 min for the scalp; 15m fetches stay ~15 min)
                     continue
             candidates.append((sym, tf, key))
     candidates.sort(key=lambda c: fetch_log.get(c[2], 0))
@@ -538,14 +873,29 @@ def main():
             if not st.get("last_time") or st.get("engine_v") != ENGINE_V:
                 # bootstrap (or risk-engine upgrade): learn current state
                 # without sending anything - no backlog posts after upgrades
-                st["signaled"] = [e["key"] for e in events][-500:]
+                st["signaled"] = [e["key"] for e in events][-1500:]
                 st["last_time"] = bars[-1]["t"]
                 st["engine_v"] = ENGINE_V
                 print("bootstrap %s (engine v%d): %d bars, %d known events"
                       % (key, ENGINE_V, len(bars), len(events)))
                 continue
+            prev_last_time = st.get("last_time") or 0
+            tf_sec = TIMEFRAMES[tf]["sec"]
             for ev in events:
                 if ev["key"] in st["signaled"]:
+                    continue
+                if ev["time"] <= prev_last_time:
+                    # older than the last processed bar: already handled in a
+                    # previous run even if its key fell out of the list
+                    st["signaled"].append(ev["key"])
+                    continue
+                if ev["kind"] == "entry" and now - ev["time"] > 2 * tf_sec:
+                    # stale "now" wording: never post an old entry late
+                    st["signaled"].append(ev["key"])
+                    continue
+                if ev["kind"] != "entry" and ev.get("entry_key") not in st.setdefault("msg_ids", {}):
+                    # follow-up for a signal never posted in this era: skip
+                    st["signaled"].append(ev["key"])
                     continue
                 if ev["kind"] != "entry" and not NOTIFY_OUTCOMES:
                     st["signaled"].append(ev["key"])
@@ -570,11 +920,15 @@ def main():
                     time.sleep(0.3)
                 else:
                     telegram_down = True
-            st["signaled"] = st["signaled"][-500:]
+            st["signaled"] = st["signaled"][-1500:]
             st["last_time"] = bars[-1]["t"]
             print("%s: %d bars, %d total events, sent so far %d"
                   % (key, len(bars), len(events), sent))
             time.sleep(1)  # be gentle with the data provider
+    try:
+        sent, telegram_down = run_scalp(state, now, sent, telegram_down)
+    except Exception as e:
+        print("scalp run failed (non-fatal):", repr(e), file=sys.stderr)
     save_state(state)
     print("done. messages sent:", sent, "fetch errors:", errors)
     if total_combos and errors == total_combos:
