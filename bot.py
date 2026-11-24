@@ -31,6 +31,7 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+import zlib
 from datetime import datetime, timezone
 
 # ------------------------------------------------------------------ config
@@ -53,10 +54,22 @@ TIMEFRAMES = {
     "4h":  {"sec": 14400, "bars": 1000, "oanda": "H4",  "td": "4h"},
 }
 
-# same defaults as the Pine inputs
-STOP_OFFSET_PIPS = 5.0
-RISK_REWARD = 2.0
+# ---- risk model (market-standard, volatility based) ----
+# Stop distance = max(zone structure + buffer, ATR(14) x ATR_MULT, pair minimum).
+ATR_LEN = 14
+ATR_MULT = 1.5
+RR_STEPS = (1.0, 2.0, 3.0)          # TP1/TP2/TP3 at 1:1, 1:2, 1:3
+ZONE_BUFFER_PIPS = 2.0              # small buffer beyond the zone edge
+MIN_STOP_PIPS = {                   # volatility floor per pair, in pips
+    "EURUSD": 10.0,
+    "GBPUSD": 12.0,
+    "USDJPY": 12.0,
+    "AUDUSD": 10.0,
+    "USDCAD": 10.0,
+    "XAUUSD": 25.0,                 # pip = 0.1 -> 25 pips = $2.50
+}
 MAX_ZONES = 1000
+ENGINE_V = 2  # bump when event keys/levels change -> silent re-bootstrap
 STATE_FILE = "state.json"
 MAX_MESSAGES_PER_RUN = 25
 
@@ -139,12 +152,25 @@ def fetch_bars(symbol_name, tf_name):
 # Faithful port of the Pine logic. Every bar index i below is the equivalent
 # of Pine's bar_index over the fetched (closed) bars only.
 
-def run_engine(bars, pip):
+def run_engine(bars, pip, min_stop):
     """Replay the indicator over bars. Return list of signal events:
-    {'key', 'time', 'kind' ('entry'|'tp'|'sl'), 'dir', 'entry', 'sl', 'tp'}"""
-    stop_offset = STOP_OFFSET_PIPS * pip
+    entry: {'key','time','kind'='entry','dir','entry','sl','tps'}
+    outcome: kind in ('tp1','tp2','tp3','sl') with 'price'"""
     zones = []   # dicts, oldest first
     events = []
+    buffer = ZONE_BUFFER_PIPS * pip
+
+    # ATR(14) of true range, simple mean, value per bar index (None until warm)
+    trs = []
+    for i, b in enumerate(bars):
+        if i == 0:
+            trs.append(b["h"] - b["l"])
+        else:
+            pc = bars[i - 1]["c"]
+            trs.append(max(b["h"] - b["l"], abs(b["h"] - pc), abs(b["l"] - pc)))
+    atr = [None] * len(bars)
+    for i in range(ATR_LEN, len(bars)):
+        atr[i] = sum(trs[i - ATR_LEN + 1: i + 1]) / ATR_LEN
 
     def engulf_at(j):
         """(bull, bear) engulfing with engulfing bar j and engulfed bar j-1."""
@@ -235,41 +261,55 @@ def run_engine(bars, pip):
                 continue
             if z["active"] or not touch(z):
                 continue
+            a = atr[i] or 0.0
+            structural = (z["top"] - z["bottom"]) + buffer
+            sl_dist = max(structural, a * ATR_MULT, min_stop)
             if z["dir"] == 1:
                 entry = z["top"]
-                sl = z["bottom"] - stop_offset
-                tp = entry + (entry - sl) * RISK_REWARD
+                sl = entry - sl_dist
+                tps = [entry + sl_dist * r for r in RR_STEPS]
             else:
                 entry = z["bottom"]
-                sl = z["top"] + stop_offset
-                tp = entry - (sl - entry) * RISK_REWARD
-            z.update(active=True, entry=entry, sl=sl, tp=tp,
-                     entry_i=i, entry_t=b["t"])
+                sl = entry + sl_dist
+                tps = [entry - sl_dist * r for r in RR_STEPS]
+            z.update(active=True, entry=entry, sl=sl, tps=tps,
+                     hits=[], entry_i=i, entry_t=b["t"])
             events.append({
-                "key": "e:%d:%d" % (z["engulf_t"], z["dir"]),
+                "key": "e2:%d:%d" % (z["engulf_t"], z["dir"]),
                 "time": b["t"], "kind": "entry", "dir": z["dir"],
-                "entry": entry, "sl": sl, "tp": tp,
+                "entry": entry, "sl": sl, "tps": tps,
             })
 
-        # ---------------- OUTCOME (TP / SL hit), same rules as the stats engine
+        # ---------------- OUTCOME: TP1/TP2/TP3 then SL; SL wins same-bar ties
         for z in zones:
             if not (z["active"] and z["closed"] is None
                     and z["entry_i"] is not None and i > z["entry_i"]):
                 continue
             if z["dir"] == 1:
-                hit_tp = b["h"] >= z["tp"]; hit_sl = b["l"] <= z["sl"]
+                hit_sl = b["l"] <= z["sl"]
+                tp_hit = [b["h"] >= tp for tp in z["tps"]]
             else:
-                hit_tp = b["l"] <= z["tp"]; hit_sl = b["h"] >= z["sl"]
-            if hit_tp and not hit_sl:
-                z["closed"] = "tp"
-                events.append({"key": "t:%d:%d" % (z["engulf_t"], z["dir"]),
-                               "time": b["t"], "kind": "tp", "dir": z["dir"],
-                               "entry": z["entry"], "sl": z["sl"], "tp": z["tp"]})
-            elif hit_sl and not hit_tp:
+                hit_sl = b["h"] >= z["sl"]
+                tp_hit = [b["l"] <= tp for tp in z["tps"]]
+            ekey = "e2:%d:%d" % (z["engulf_t"], z["dir"])
+            if hit_sl:
                 z["closed"] = "sl"
-                events.append({"key": "t:%d:%d" % (z["engulf_t"], z["dir"]),
+                events.append({"key": "x2:%d:%d" % (z["engulf_t"], z["dir"]),
                                "time": b["t"], "kind": "sl", "dir": z["dir"],
-                               "entry": z["entry"], "sl": z["sl"], "tp": z["tp"]})
+                               "entry": z["entry"], "price": z["sl"],
+                               "entry_key": ekey})
+                continue
+            for n, hit in enumerate(tp_hit, start=1):
+                if hit and n not in z["hits"]:
+                    z["hits"].append(n)
+                    events.append({
+                        "key": "t2:%d:%d:%d" % (z["engulf_t"], z["dir"], n),
+                        "time": b["t"], "kind": "tp%d" % n, "dir": z["dir"],
+                        "entry": z["entry"], "price": z["tps"][n - 1],
+                        "entry_key": ekey,
+                    })
+            if len(z["hits"]) == len(z["tps"]):
+                z["closed"] = "tp3"
 
         # ---------------- zone cap (mirror Pine's drawing limit) -------------
         if len(zones) > MAX_ZONES:
@@ -287,32 +327,39 @@ def run_engine(bars, pip):
 
 # ------------------------------------------------------------------ telegram
 
-def send_telegram(text):
+def send_telegram(text, reply_to=None):
+    """Send a message; return its Telegram message_id, or None on failure."""
     if DRY_RUN:
-        print("[DRY RUN telegram]", text.replace("\n", " | "))
-        return True
+        print("[DRY RUN telegram%s] %s"
+              % (" (reply to %s)" % reply_to if reply_to else "",
+                 text.replace("\n", " | ")))
+        return -1  # fake id so callers treat it as sent
     token = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     relay = os.environ.get("TELEGRAM_RELAY", "").strip()
     if not chat or (not relay and not token):
         print("ERROR: TELEGRAM_RELAY or TELEGRAM_TOKEN + TELEGRAM_CHAT_ID not set", file=sys.stderr)
-        return False
-    # relay: a Cloudflare Worker holding the bot token, used because
-    # api.telegram.org throttle-lists datacenter egress IPs
+        return None
+    # relay: a server holding the bot token, used because api.telegram.org
+    # throttle-lists datacenter egress IPs; it forwards the body verbatim
     url = relay if relay else "https://api.telegram.org/bot%s/sendMessage" % token
-    payload = json.dumps({"chat_id": chat, "text": text}).encode()
+    body = {"chat_id": chat, "text": text}
+    if reply_to:
+        body["reply_to_message_id"] = reply_to
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json", **UA})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
-            return r.status == 200
+            data = json.loads(r.read().decode())
+            return data.get("result", {}).get("message_id")
     except urllib.error.HTTPError as e:
         print("telegram error:", e.code, e.read()[:200], file=sys.stderr)
-        return False
+        return None
     except Exception as e:
         # hang/timeout/refused (transient) -> log, skip this run, retry next run
         print("telegram send failed (transient):", repr(e), file=sys.stderr)
-        return False
+        return None
 
 
 def fmt_price(x, pip):
@@ -320,25 +367,69 @@ def fmt_price(x, pip):
     return ("%.*f" % (decimals, x)).rstrip("0").rstrip(".") if "." in ("%.*f" % (decimals, x)) else ("%.*f" % (decimals, x))
 
 
+# --- template variants: rotated deterministically per signal (stable per key)
+ENTRY_HEADS = [
+    "\U0001F6A8 توصية %s | %s @ %s",
+    "⚡ توصية %s\n%s @ %s",
+    "\U0001F525 توصية %s يا صنايعية\n%s @ %s",
+]
+ENTRY_BUY = ["شراء الآن 🟢🚀", "شراء الآن 🟢💪", "شراء الآن 🟢📈"]
+ENTRY_SELL = ["بيع مباشر الآن 🔴🔥", "بيع مباشر الآن 🔴📉", "بيع مباشر الآن 🔴⚡"]
+ENTRY_BLOCKS = [
+    ["\U0001F3AF TP1: %s 👑", "\U0001F3AF TP2: %s 👑", "\U0001F3AF TP3: %s 👑", "\U0001F6D1 SL: %s ☠️"],
+    ["1️⃣ الهدف الأول: %s 👑", "2️⃣ الهدف الثاني: %s 👑", "3️⃣ الهدف الثالث: %s 👑", "\U0001F6D1 الستوب: %s ☠️"],
+    ["\U0001F947 الهدف 1: %s", "\U0001F948 الهدف 2: %s", "\U0001F949 الهدف 3: %s", "☠️ الستوب: %s"],
+]
+TF_LINES = ["⏱ الفريم: %s", "الفريم ⏱: %s", "🕐 الفريم: %s"]
+TP_TEXTS = {
+    1: ["👑 الهدف الأول اتحقق ✅🎉 (%s)\nربح +%s نقطة 💰",
+        "\U0001F3AF TP1 خبط الهدف ✅🔥 (%s)\n+%s نقطة مكسب 💵"],
+    2: ["👑👑 الهدف الثاني اتحقق ✅🎉🎉🔥 (%s)\nربح +%s نقطة 💰💰",
+        "🔥 TP2 تاني هدف في الجيب ✅💪 (%s)\n+%s نقطة مكسب 💵💵"],
+    3: ["👑👑👑 الهدف الثالث اتحقق ✅🏆🎉🎉🎉 (%s)\nربح +%s نقطة 🏆💰",
+        "\U0001F3C6 TP3 الهدف الكامل اتحقق ✅🎉🎉 (%s)\n+%s نقطة مكسب كامل 💰\U0001F3C6"],
+}
+SL_TEXTS = [
+    "\U0001F6D1 ضربت الستوب، ونستنى الفرصة الجاية 🤍 (%s)\n-%s نقطة",
+    "☠️ الستوب ضربت، سلامتها من غيرها 🤲 (%s)\nخسارة -%s نقطة",
+    "\U0001F6D1 خرجنا على الستوب، والسوق فيه فرص كل يوم 🤍 (%s)\n-%s نقطة",
+]
+
+
+def _variant(seed_key, options):
+    return options[zlib.crc32(seed_key.encode("utf-8")) % len(options)]
+
+
+def _fmt_pips(pips):
+    r = round(pips, 1)
+    return ("%g" % r)
+
+
 def build_message(sym, tf, ev):
+    pip = SYMBOLS[sym]["pip"]
     if ev["kind"] == "entry":
-        d = "BUY شراء" if ev["dir"] == 1 else "SELL بيع"
-        return (
-            "🚨 إشارة HAKIM_FX\n"
-            "الزوج: %s\n"
-            "الفريم: %s\n"
-            "الاتجاه: %s\n"
-            "الدخول Entry: %s\n"
-            "الستوب SL: %s\n"
-            "الهدف TP: %s"
-        ) % (sym, tf, d,
-             fmt_price(ev["entry"], SYMBOLS[sym]["pip"]),
-             fmt_price(ev["sl"], SYMBOLS[sym]["pip"]),
-             fmt_price(ev["tp"], SYMBOLS[sym]["pip"]))
-    else:
-        d = "BUY" if ev["dir"] == 1 else "SELL"
-        mark = "✅ ضربت الهدف (TP)" if ev["kind"] == "tp" else "❌ ضربت الستوب (SL)"
-        return "HAKIM_FX %s\nالزوج: %s - الفريم: %s - %s" % (mark, sym, tf, d)
+        heads = ENTRY_BUY if ev["dir"] == 1 else ENTRY_SELL
+        head = _variant(ev["key"] + "h", heads)
+        tpl = _variant(ev["key"] + "t", ENTRY_HEADS)
+        block = _variant(ev["key"] + "b", ENTRY_BLOCKS)
+        tfline = _variant(ev["key"] + "f", TF_LINES) % tf
+        lines = [
+            tpl % (head, sym, fmt_price(ev["entry"], pip)),
+            tfline,
+            "",
+            block[0] % fmt_price(ev["tps"][0], pip),
+            block[1] % fmt_price(ev["tps"][1], pip),
+            block[2] % fmt_price(ev["tps"][2], pip),
+            block[3] % fmt_price(ev["sl"], pip),
+        ]
+        return "\n".join(lines)
+    pips = (ev["price"] - ev["entry"]) * ev["dir"] / pip
+    if ev["kind"].startswith("tp"):
+        n = int(ev["kind"][2])
+        tpl = _variant(ev["key"] + "o", TP_TEXTS[n])
+        return tpl % (fmt_price(ev["price"], pip), _fmt_pips(abs(pips)))
+    tpl = _variant(ev["key"] + "o", SL_TEXTS)
+    return tpl % (fmt_price(ev["price"], pip), _fmt_pips(abs(pips)))
 
 
 # ------------------------------------------------------------------ main
@@ -390,13 +481,17 @@ def main():
             if len(bars) < 10:
                 print("too few bars for", key)
                 continue
-            events = run_engine(bars, SYMBOLS[sym]["pip"])
+            events = run_engine(bars, SYMBOLS[sym]["pip"],
+                                MIN_STOP_PIPS[sym] * SYMBOLS[sym]["pip"])
             st = state.setdefault(key, {"last_time": 0, "signaled": []})
-            if not st.get("last_time"):
-                # bootstrap: learn current state without sending anything
+            if not st.get("last_time") or st.get("engine_v") != ENGINE_V:
+                # bootstrap (or risk-engine upgrade): learn current state
+                # without sending anything - no backlog posts after upgrades
                 st["signaled"] = [e["key"] for e in events][-500:]
                 st["last_time"] = bars[-1]["t"]
-                print("bootstrap %s: %d bars, %d known events" % (key, len(bars), len(events)))
+                st["engine_v"] = ENGINE_V
+                print("bootstrap %s (engine v%d): %d bars, %d known events"
+                      % (key, ENGINE_V, len(bars), len(events)))
                 continue
             for ev in events:
                 if ev["key"] in st["signaled"]:
@@ -410,8 +505,16 @@ def main():
                     # one failed send means Telegram is unreachable this run:
                     # stop attempting (no hammering), retry everything next run
                     break
-                if send_telegram(build_message(sym, tf, ev)):
+                reply_to = None
+                if ev["kind"] != "entry":
+                    reply_to = st.setdefault("msg_ids", {}).get(ev.get("entry_key"))
+                mid = send_telegram(build_message(sym, tf, ev), reply_to=reply_to)
+                if mid:
                     st["signaled"].append(ev["key"])
+                    if ev["kind"] == "entry":
+                        ids = st.setdefault("msg_ids", {})
+                        ids[ev["key"]] = mid
+                        st["msg_ids"] = dict(list(ids.items())[-200:])
                     sent += 1
                     time.sleep(0.3)
                 else:
