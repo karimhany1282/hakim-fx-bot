@@ -874,6 +874,7 @@ def main():
                 # bootstrap (or risk-engine upgrade): learn current state
                 # without sending anything - no backlog posts after upgrades
                 st["signaled"] = [e["key"] for e in events][-1500:]
+                st["msg_ids"] = {}  # old message ids are dead after a reset
                 st["last_time"] = bars[-1]["t"]
                 st["engine_v"] = ENGINE_V
                 print("bootstrap %s (engine v%d): %d bars, %d known events"
