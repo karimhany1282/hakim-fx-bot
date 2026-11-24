@@ -32,6 +32,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import zlib
+import math
 from datetime import datetime, timezone
 
 # ------------------------------------------------------------------ config
@@ -879,6 +880,218 @@ def run_scalp(state, now, sent, telegram_down):
     return sent, telegram_down
 
 
+# ------------------------------------------------------------------ ML-ranked gold
+# ML-ranked multi-rule gold system (research package of 24 Nov, approved by
+# Karim for the channel). Six rule votes + 16 features -> frozen ridge score;
+# a signal fires when score > ML_THR (one per bar, no consecutive bars).
+# Thresholds and weights are frozen by the research - do not tune.
+# Geometry: SL = 1.5*ATR(14), TP1/2/3 = 2x/3x/4x the SL distance; the shared
+# position tracker moves SL to entry after TP1, like the other gold signals.
+ML_KEY = "XAUUSD_ml"
+ML_W = [-0.004795361647470501, -0.006931398440520428, -0.00814816486513296, -0.011991680176664138, -0.025593175199036068, -0.0312814957322029, 0.011097220773312867, 0.049259037989981116, 0.005855442604092558, 0.009182156240966148, 0.013608390281354254, -0.0013089628711275949, -0.0071497412161657045, 0.016460904622307006, -0.004638415863337652, 0.013888862390991122, 0.01691248758555308, -0.009212230324969536, 0.0010324959888403731, 0.007083511794288525, 0.009676707989731716, 0.00015151266155998916]
+ML_MU = [-0.3874469449515239, -0.4689251123252492, -0.47291956920334227, -0.4131589991939655, -0.21745905774264931, -0.17835113678758882, 2.8748773841928283, 5.254585920771126, 0.9313663159509391, 0.9773738174158573, 0.18804528268597603, -0.3238014244960126, -0.07357367655162507, 0.028524279985362656, 0.009202192645398167, 1.4253360559752943, 0.05422577239131433, 0.25863287885047975, 0.008474498462103476, 0.04469540467336914, 0.10865353716200707, 0.7137951613643667]
+ML_SD = [0.7592704528855888, 0.9451281139834996, 1.1358379123325981, 1.534109962534404, 2.078459237332209, 1.2161657688710972, 4.293466346130285, 9.957192062754034, 0.4414267190454469, 0.790324949284703, 0.3319663047182797, 0.5276914475228933, 0.3098760471825951, 0.7168416962720339, 0.6965914659358765, 1.4790278451582675, 0.22646266458903755, 0.43788344762465303, 0.09166614162961118, 0.20663428052434085, 0.31120402736245256, 0.45198631603302175]
+ML_THR = 0.17741965918397018
+
+
+def _sign(x):
+    return (x > 0) - (x < 0)
+
+
+def fetch_paxg_5m_ml(pages=5, limit=1000):
+    """~5000 closed Mon-Fri 5m PAXG bars incl. volume + taker-buy volume,
+    oldest first. The ML model was fit on this exact window (the reference
+    engine's wk filter: Mon-Fri UTC bars only)."""
+    out = []
+    end = None
+    for _ in range(pages):
+        url = BINANCE_KLINES + "&limit=%d" % limit
+        if end:
+            url += "&endTime=%d" % end
+        k = _get_json(url)
+        now_ms = time.time() * 1000
+        batch = [{"t": x[0] / 1000.0, "o": float(x[1]), "h": float(x[2]),
+                  "l": float(x[3]), "c": float(x[4]), "v": float(x[5]),
+                  "tb": float(x[9])} for x in k if x[6] < now_ms]
+        out = batch + out
+        if not k or len(k) < limit:
+            break
+        end = int(batch[0]["t"] * 1000) - 1
+    return [b for b in out if time.gmtime(b["t"]).tm_wday <= 4]
+
+
+def ml_signals(bars):
+    """Python port of engine.js mlSignals (signal side only; SL/TP outcomes
+    are tracked by the live position machinery, not replayed here).
+    Returns [{i, d, score, time, dist}] for bars passing the threshold."""
+    n = len(bars)
+    c = [x["c"] for x in bars]
+    a = _atr_sma(bars)
+    e20 = _ema(c, 20)
+    e200 = _ema(c, 200)
+    e600 = _ema(c, 600)
+    e2400 = _ema(c, 2400)
+    r2 = _rsi2(c)
+    am = [sum(a[i - 575:i + 1]) / 576.0 if i >= 576 + 13 else float("nan")
+          for i in range(n)]
+    hi12 = [max(y["h"] for y in bars[i - 12:i]) if i >= 12 else float("nan")
+            for i in range(n)]
+    lo12 = [min(y["l"] for y in bars[i - 12:i]) if i >= 12 else float("nan")
+            for i in range(n)]
+    cand = []
+    for i in range(2400, n):
+        x = bars[i]
+        if not a[i] > 0:
+            continue
+        t = time.gmtime(x["t"])
+        hr = t.tm_hour
+        dw = (t.tm_wday + 1) % 7  # JS getUTCDay(): Sun=0
+        if (dw == 5 and hr >= 21) or (dw == 1 and hr < 1):
+            continue
+        vr = a[i] / am[i]
+        rg = (x["h"] - x["l"]) / a[i]
+        loc = (x["c"] - x["l"]) / (x["h"] - x["l"] + 1e-9)
+        tbr = x["tb"] / (x["v"] + 1e-9)
+        best = None
+        for d in (1, -1):
+            vt = [0] * 6
+            if d > 0:
+                vt[0] = 1 if (x["l"] < lo12[i] and x["c"] > lo12[i]
+                              and vr < 0.8) else 0
+                cond1 = r2[i] < 20 and x["c"] > e200[i]
+            else:
+                vt[0] = 1 if (x["h"] > hi12[i] and x["c"] < hi12[i]
+                              and vr < 0.8) else 0
+                cond1 = r2[i] > 80 and x["c"] < e200[i]
+            vt[1] = 1 if (cond1 and vr < 1.0) else 0
+            ex = rg > 2 and (loc <= 0.3 if d > 0 else loc >= 0.7)
+            tra = (1 if _sign(x["c"] - e600[i]) == d else 0) + \
+                  (1 if _sign(e600[i] - e2400[i]) == d else 0)
+            vt[2] = 1 if (ex and vr >= 1 and 12 <= hr < 17 and tra >= 1) else 0
+            vt[3] = 1 if (rg > 2.5 and (loc <= 0.3 if d > 0
+                                        else loc >= 0.7)) else 0
+            if d > 0:
+                vt[4] = 1 if (x["c"] > e200[i] and x["c"] < e20[i]
+                              and x["c"] > x["o"]
+                              and c[i - 1] < bars[i - 1]["o"]) else 0
+                vt[5] = 1 if (loc < 0.15 and x["c"] > e200[i]) else 0
+            else:
+                vt[4] = 1 if (x["c"] < e200[i] and x["c"] > e20[i]
+                              and x["c"] < x["o"]
+                              and c[i - 1] > bars[i - 1]["o"]) else 0
+                vt[5] = 1 if (loc > 0.85 and x["c"] < e200[i]) else 0
+            if not any(vt):
+                continue
+            f = [d * (x["c"] - c[i - k]) / a[i] for k in (1, 2, 3, 6, 12)]
+            f += [d * (x["c"] - e20[i]) / a[i],
+                  d * (x["c"] - e200[i]) / a[i],
+                  d * (x["c"] - e600[i]) / a[i],
+                  vr, rg, loc if d > 0 else 1 - loc,
+                  (r2[i] - 50) * d / 50, (tbr - 0.5) * d,
+                  math.sin(hr / 24 * 6.283), math.cos(hr / 24 * 6.283),
+                  (x["c"] - lo12[i]) / a[i] if d > 0
+                  else (hi12[i] - x["c"]) / a[i]]
+            f += vt
+            s = 0.0
+            for q in range(len(f)):
+                s += ((f[q] - ML_MU[q]) / ML_SD[q]) * ML_W[q]
+            if best is None or s > best[0]:
+                best = (s, d)
+        if best is not None:
+            cand.append((i, best[0], best[1]))
+    out = []
+    last_i = -9
+    for i, s, d in cand:
+        if not s > ML_THR:
+            continue
+        if i - last_i <= 1:
+            continue
+        last_i = i
+        out.append({"i": i, "d": d, "score": s,
+                    "time": bars[i]["t"] + 300, "dist": a[i] * 1.5})
+    return out
+
+
+def run_ml(state, now, sent, telegram_down):
+    """Post ML-ranked gold signals from the latest closed 5m bar. Shares the
+    scalp state (positions/msg_ids/signaled), so touch watching, threaded
+    follow-ups and the weekend gate behave exactly like the other gold
+    signals. Returns (sent, telegram_down)."""
+    st = state.setdefault(ML_KEY, {"ml_v": 1, "last_bar": 0})
+    if not xau_open():
+        return sent, telegram_down
+    if (int(now) // 300 - 1) * 300 <= st.get("last_bar", 0):
+        return sent, telegram_down
+    try:
+        bars = fetch_paxg_5m_ml()
+    except Exception as e:
+        print("ML PAXG fetch failed:", repr(e), file=sys.stderr)
+        return sent, telegram_down
+    if len(bars) < 2500:
+        print("too few ML bars:", len(bars))
+        return sent, telegram_down
+    if int(bars[-1]["t"]) <= st.get("last_bar", 0):
+        return sent, telegram_down  # exchange lag; retried next run
+    fresh = [s for s in ml_signals(bars) if s["time"] == bars[-1]["t"] + 300]
+    if not fresh:
+        st["last_bar"] = int(bars[-1]["t"])
+        return sent, telegram_down
+    s = fresh[0]
+    bar_t = int(bars[s["i"]]["t"])
+    key = "ml:%d:%d" % (bar_t, s["d"])
+    sc = state.setdefault(SCALP_KEY, {"scalp_v": SCALP_V, "last_time": 0,
+                                      "signaled": [], "msg_ids": {},
+                                      "positions": {}})
+    if key in sc["signaled"]:
+        st["last_bar"] = bar_t
+        return sent, telegram_down
+    if now - (bar_t + 300) > SCALP_STALE_SEC:
+        st["last_bar"] = bar_t
+        return sent, telegram_down
+    # conflict policy vs the existing gold rules: never contradict an open
+    # gold position, never double-post a bar the scalp engine already fired
+    suffix = ":%d:%d" % (bar_t, s["d"])
+    same_bar = any(k.endswith(suffix) for k in sc["signaled"])
+    opposite = any(p.get("dir") == -s["d"] for p in sc["positions"].values())
+    if same_bar or opposite:
+        sc["signaled"].append(key)
+        st["last_bar"] = bar_t
+        print("ML signal suppressed (%s): %s"
+              % ("same-bar" if same_bar else "opposite-open", key))
+        return sent, telegram_down
+    if sent >= MAX_MESSAGES_PER_RUN or telegram_down:
+        return sent, telegram_down  # retried next run until stale
+    live = td_quote_xau()
+    if live is None:
+        print("XAU quote unavailable; deferring ML signal", file=sys.stderr)
+        return sent, telegram_down
+    d = s["d"]
+    dist = s["dist"]
+    basis = live - bars[s["i"]]["c"]
+    entry = live
+    sl = entry - d * dist
+    tps = [entry + d * 2 * dist, entry + d * 3 * dist, entry + d * 4 * dist]
+    mid = send_telegram(build_scalp_entry(d, entry, tps, sl, key))
+    if not mid:
+        return sent, True
+    sc["signaled"].append(key)
+    sc["msg_ids"][key] = mid
+    sc["positions"][key] = {
+        "entry_key": key, "dir": d, "rule": "ml",
+        "s": dist, "entry_xau": entry, "sl_xau": sl, "tps_xau": tps,
+        "entry_p": entry - basis, "sl_p": sl - basis,
+        "tps_p": [tp - basis for tp in tps],
+        "sig_bar_t": bar_t,
+        "sig_bar_i": s["i"],
+        "tps_hit": 0,
+    }
+    st["last_bar"] = bar_t
+    sent += 1
+    time.sleep(0.3)
+    print("ML signal posted: %s score %.3f mid %s" % (key, s["score"], mid))
+    return sent, telegram_down
+
+
 # ------------------------------------------------------------------ main
 
 GH_PAT = os.environ.get("GH_PAT", "").strip()
@@ -1046,12 +1259,18 @@ def main():
                   % (key, len(bars), len(events), sent))
             time.sleep(1)  # be gentle with the data provider
     scalp_before = json.dumps(state.get(SCALP_KEY), sort_keys=True)
+    ml_before = json.dumps(state.get(ML_KEY), sort_keys=True)
     try:
         sent, telegram_down = run_scalp(state, now, sent, telegram_down)
     except Exception as e:
         print("scalp run failed (non-fatal):", repr(e), file=sys.stderr)
+    try:
+        sent, telegram_down = run_ml(state, now, sent, telegram_down)
+    except Exception as e:
+        print("ML run failed (non-fatal):", repr(e), file=sys.stderr)
     if (fetches_done or sent
-            or json.dumps(state.get(SCALP_KEY), sort_keys=True) != scalp_before):
+            or json.dumps(state.get(SCALP_KEY), sort_keys=True) != scalp_before
+            or json.dumps(state.get(ML_KEY), sort_keys=True) != ml_before):
         save_state(state)
     else:
         print("no state changes; skipping save")
