@@ -359,6 +359,7 @@ def save_state(state):
 def main():
     state = load_state()
     sent = 0
+    telegram_down = False
     errors = 0
     td_gate = PROVIDER == "twelvedata"
     now = time.time()
@@ -405,10 +406,16 @@ def main():
                     continue
                 if sent >= MAX_MESSAGES_PER_RUN:
                     break
+                if telegram_down:
+                    # one failed send means Telegram is unreachable this run:
+                    # stop attempting (no hammering), retry everything next run
+                    break
                 if send_telegram(build_message(sym, tf, ev)):
                     st["signaled"].append(ev["key"])
                     sent += 1
                     time.sleep(0.3)
+                else:
+                    telegram_down = True
             st["signaled"] = st["signaled"][-500:]
             st["last_time"] = bars[-1]["t"]
             print("%s: %d bars, %d total events, sent so far %d"
