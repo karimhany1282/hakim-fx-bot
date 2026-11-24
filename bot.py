@@ -440,6 +440,10 @@ def build_message(sym, tf, ev):
 # below spot). Touch detection reuses the stored constant basis so PAXG bars
 # can be checked against XAU-referenced levels.
 SCALP_KEY = "XAUUSD_scalp"
+GOLD_LIVE = False  # PAUSED by Karim 24 Nov 15:03 EET: gold scalp evaluates in
+# dry-run only (recorded, never posted, no positions) until a proven strategy
+# exists. Re-enable only on parent's instruction. ML system is held the same
+# way (ML_LIVE below).
 SCALP_V = 1
 SCALP_STALE_SEC = 1800          # "buy now" wording: never post a scalp >30 min old
 BINANCE_KLINES = "https://data-api.binance.vision/api/v3/klines?symbol=PAXGUSDT&interval=5m"
@@ -744,6 +748,34 @@ def run_scalp(state, now, sent, telegram_down):
         return sent, telegram_down
     # locate each stored position's signal bar in this window
     t_index = {int(b["t"]): i for i, b in enumerate(bars)}
+    if not GOLD_LIVE:
+        # dry-run: record what would have posted, keep dedupe bookkeeping so
+        # re-enable is clean, but send nothing and open no positions
+        dry = st.setdefault("dry_scalp", [])
+        groups = {}
+        for e in entries:
+            groups.setdefault((int(bars[e["bar_i"]]["t"]), e["dir"]), []).append(e)
+        for gkey in sorted(groups):
+            evs = groups[gkey]
+            rep = next((e for e in evs if e["rule"] == "sweep"), evs[0])
+            if any(e["key"] in st["signaled"] for e in evs):
+                continue
+            for e in evs:
+                st["signaled"].append(e["key"])
+            if now - rep["sig_time"] > SCALP_STALE_SEC:
+                continue
+            dry.append({"key": rep["key"], "time": rep["sig_time"],
+                        "dir": rep["dir"], "rule": rep["rule"],
+                        "dist": round(rep["s"], 3)})
+            print("scalp DRY-RUN signal (gold paused, not sent):", rep["key"])
+        st["dry_scalp"] = dry[-200:]
+        st["signaled"] = st["signaled"][-1500:]
+        st["last_time"] = bars[-1]["t"]
+        if st["positions"]:
+            # should not happen: positions were closed before the pause
+            print("WARNING: %d gold positions still open while paused"
+                  % len(st["positions"]), file=sys.stderr)
+        return sent, telegram_down
     # --- new entries ---
     groups = {}
     for e in entries:
