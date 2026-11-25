@@ -1463,6 +1463,10 @@ def main():
     FETCH_BUDGET = 7
     candidates = []
     for sym in SYMBOLS:
+        if sym == "XAUUSD" and not GOLD_LIVE:
+            # gold paused (Karim 24 Nov 15:03 EET): scalp+ML are dry-run;
+            # the forex engine must not trade XAUUSD either
+            continue
         for tf in TIMEFRAMES:
             key = "%s_%s" % (sym, tf)
             if td_gate:
