@@ -444,6 +444,11 @@ GOLD_LIVE = False  # PAUSED by Karim 24 Nov 15:03 EET: gold scalp evaluates in
 # dry-run only (recorded, never posted, no positions) until a proven strategy
 # exists. Re-enable only on parent's instruction. ML system is held the same
 # way (ML_LIVE below).
+POSTING_LIVE = False  # STOPPED by Karim 25 Nov 16:46 EET (own WhatsApp:
+# "leave msg 115, stop posting anything on the channel now"): NOTHING posts -
+# no forex signals, no follow-ups. Engines keep evaluating; skipped forex
+# events are dry-logged to state["dry_forex"]. Re-enable only on parent's
+# instruction.
 SCALP_V = 1
 SCALP_STALE_SEC = 1800          # "buy now" wording: never post a scalp >30 min old
 BINANCE_KLINES = "https://data-api.binance.vision/api/v3/klines?symbol=PAXGUSDT&interval=5m"
@@ -1530,6 +1535,16 @@ def main():
                     st["signaled"].append(ev["key"])
                     continue
                 if ev["kind"] != "entry" and not NOTIFY_OUTCOMES:
+                    st["signaled"].append(ev["key"])
+                    continue
+                if not POSTING_LIVE:
+                    # channel fully paused: dry-run log, never send
+                    dr = state.setdefault("dry_forex", [])
+                    dr.append({"t": now, "sec": key, "key": ev["key"],
+                               "kind": ev["kind"], "dir": ev["dir"],
+                               "entry": ev.get("entry"),
+                               "price": ev.get("price")})
+                    state["dry_forex"] = dr[-200:]
                     st["signaled"].append(ev["key"])
                     continue
                 if sent >= MAX_MESSAGES_PER_RUN:
